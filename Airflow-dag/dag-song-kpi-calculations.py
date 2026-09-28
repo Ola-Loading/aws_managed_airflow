@@ -23,7 +23,7 @@ default_args = {
 }
 
 # Constants for S3 bucket and file paths
-BUCKET_NAME = 'music-udemylab-bucket'
+BUCKET_NAME = 'music-sofar-sessions'
 SONGS_FILE_PATH = 'spotify_data/songs.csv'
 USERS_FILE_PATH = 'spotify_data/users.csv'
 STREAMS_PREFIX = 'spotify_data/streams/'
@@ -71,13 +71,13 @@ def validate_dataframe(df, dataset_name, source_name):
     logging.warning(f"Missing columns in {source_name}: {missing_columns}")
     return False
 
-def validate_datasets():
+def validate_datasets(ti):
     validation_results = {}
 
 
     datasets = {
         "songs":{"type": "single",
-                 "path":SONGS_FILE_PATH }, 
+                 "path":SONGS_FILE_PATH },
         "users":{"type": "single",
                  "path":USERS_FILE_PATH },
         "stream":{"type": "multiple",
@@ -87,7 +87,8 @@ def validate_datasets():
     for dataset, config in datasets.items():
         try:
             if config["type"] == 'multiple':
-                files = list_s3_files(config["prefix"])
+                files = list_s3_files(config["path"])
+                ti.xcom_push(key='stream_files', value=files)
                 results = []
 
                 for file in files:
@@ -123,6 +124,68 @@ def branch_task(ti):
         return 'calculate_genre_level_kpis'
     else:
         return 'end_dag'
+
+def bootstrap_redshift_schema():
+    # Assumes songs_db already exists and the redshift_default connection points at it -
+    # CREATE DATABASE itself is a one-time admin action, not something this DAG's own
+    # connection (already scoped to a specific database) can run idempotently per execution.
+    redshift_hook = PostgresHook(postgres_conn_id="redshift_default")
+    conn = redshift_hook.get_conn()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+        CREATE SCHEMA IF NOT EXISTS reporting_schema;
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.genre_level_kpis (
+            listen_date DATE NOT NULL,
+            track_genre VARCHAR(255) NOT NULL,
+            listen_count INT,
+            popularity_index FLOAT,
+            average_duration FLOAT,
+            most_popular_track_id VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.tmp_genre_level_kpis (
+            listen_date DATE NOT NULL,
+            track_genre VARCHAR(255) NOT NULL,
+            listen_count INT,
+            popularity_index FLOAT,
+            average_duration FLOAT,
+            most_popular_track_id VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.hourly_kpis (
+            listen_date DATE NOT NULL,
+            listen_hour INT NOT NULL,
+            unique_listeners INT,
+            listen_counts INT,
+            top_artist VARCHAR(255),
+            avg_sessions_per_user FLOAT,
+            diversity_index FLOAT,
+            most_engaged_age_group VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.tmp_hourly_kpis (
+            listen_date DATE NOT NULL,
+            listen_hour INT NOT NULL,
+            unique_listeners INT,
+            listen_counts INT,
+            top_artist VARCHAR(255),
+            avg_sessions_per_user FLOAT,
+            diversity_index FLOAT,
+            most_engaged_age_group VARCHAR(255)
+        );
+        """)
+        conn.commit()
+        logging.info("Ensured reporting_schema and KPI tables exist in Redshift")
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Failed to bootstrap Redshift schema: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
 def upsert_to_redshift(df, table_name, id_columns):
     redshift_hook = PostgresHook(postgres_conn_id="redshift_default")
@@ -166,8 +229,8 @@ def upsert_to_redshift(df, table_name, id_columns):
         cursor.close()
         conn.close()
 
-def calculate_genre_level_kpis():
-    stream_files = list_s3_files(STREAMS_PREFIX)
+def calculate_genre_level_kpis(ti):
+    stream_files = ti.xcom_pull(task_ids='validate_datasets', key='stream_files')
     streams_data = pd.concat([read_s3_csv(file) for file in stream_files], ignore_index=True)
     songs_data = read_s3_csv(SONGS_FILE_PATH)
 
@@ -194,9 +257,9 @@ def calculate_genre_level_kpis():
 
     upsert_to_redshift(final_kpis, 'genre_level_kpis', ['listen_date', 'track_genre'])
 
-def calculate_hourly_kpis():
+def calculate_hourly_kpis(ti):
 
-    stream_files = list_s3_files(STREAMS_PREFIX)
+    stream_files = ti.xcom_pull(task_ids='validate_datasets', key='stream_files')
     streams_data = pd.concat([read_s3_csv(file) for file in stream_files], ignore_index=True)
     songs_data = read_s3_csv(SONGS_FILE_PATH)
     users_data = read_s3_csv(USERS_FILE_PATH)
@@ -215,8 +278,8 @@ def calculate_hourly_kpis():
 
     # KPI 3: Listening Sessions per User per Hour
     full_data['session_id'] = full_data['user_id'].astype(str) + '-' + full_data['listen_time'].astype(str)
-    sessions_per_user = full_data.groupby(['listen_date', 'listen_hour', 'user_id']).nunique('session_id').reset_index()
-    avg_sessions_per_user = sessions_per_user.groupby(['listen_date', 'listen_hour'])['session_id'].mean().reset_index(name='avg_sessions_per_user')
+    sessions_per_user = full_data.groupby(['listen_date', 'listen_hour', 'user_id'])['session_id'].nunique().reset_index(name='session_count')
+    avg_sessions_per_user = sessions_per_user.groupby(['listen_date', 'listen_hour'])['session_count'].mean().reset_index(name='avg_sessions_per_user')
 
     # KPI 4: Hourly Track Diversity Index
     track_diversity = full_data.groupby(['listen_date', 'listen_hour'])['track_id'].agg(['nunique', 'count']).reset_index()
@@ -233,9 +296,6 @@ def calculate_hourly_kpis():
     final_kpis = final_kpis.merge(track_diversity[['listen_date', 'listen_hour', 'diversity_index']], on=['listen_date', 'listen_hour'])
     final_kpis = final_kpis.merge(most_engaged_group[['listen_date', 'listen_hour', 'most_engaged_age_group']], on=['listen_date', 'listen_hour'])
 
-    # Handle potential column conflicts from merges
-    final_kpis = final_kpis.rename(columns={'listen_counts_x': 'listen_counts'})
-
     # Select the final columns explicitly to match the Redshift table schema
     final_kpis = final_kpis[['listen_date', 'listen_hour', 'unique_listeners', 'listen_counts', 'top_artist',
                              'avg_sessions_per_user', 'diversity_index', 'most_engaged_age_group']]
@@ -245,13 +305,13 @@ def calculate_hourly_kpis():
 
     upsert_to_redshift(final_kpis, 'hourly_kpis', ['listen_date', 'listen_hour'])
 
-def move_processed_files():
+def move_processed_files(ti):
     s3 = boto3.client('s3')
     try:
-        stream_files = list_s3_files(STREAMS_PREFIX)
+        stream_files = ti.xcom_pull(task_ids='validate_datasets', key='stream_files')
         for file in stream_files:
             copy_source = {'Bucket': BUCKET_NAME, 'Key': file}
-            destination_key = file.replace('spotify_data/streams/', 'spotify_data/streams/archived/')
+            destination_key = file.replace(STREAMS_PREFIX, ARCHIVE_PREFIX)
             s3.copy_object(CopySource=copy_source, Bucket=BUCKET_NAME, Key=destination_key)
             s3.delete_object(Bucket=BUCKET_NAME, Key=file)
             logging.info(f"Moved {file} to {destination_key}")
@@ -260,6 +320,11 @@ def move_processed_files():
         raise
 
 with DAG('data_validation_and_kpi_computation', default_args=default_args, schedule='@daily') as dag:
+    bootstrap_schema = PythonOperator(
+        task_id='bootstrap_redshift_schema',
+        python_callable=bootstrap_redshift_schema
+    )
+
     validate_datasets = PythonOperator(
         task_id='validate_datasets',
         python_callable=validate_datasets
@@ -290,5 +355,5 @@ with DAG('data_validation_and_kpi_computation', default_args=default_args, sched
         task_id='end_dag'
     )
 
-    validate_datasets >> check_validation >> [calculate_genre_level_kpis,end_dag]
+    bootstrap_schema >> validate_datasets >> check_validation >> [calculate_genre_level_kpis,end_dag]
     calculate_genre_level_kpis >> calculate_hourly_kpis>>move_files
