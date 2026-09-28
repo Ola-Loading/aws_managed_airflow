@@ -125,6 +125,68 @@ def branch_task(ti):
     else:
         return 'end_dag'
 
+def bootstrap_redshift_schema():
+    # Assumes songs_db already exists and the redshift_default connection points at it -
+    # CREATE DATABASE itself is a one-time admin action, not something this DAG's own
+    # connection (already scoped to a specific database) can run idempotently per execution.
+    redshift_hook = PostgresHook(postgres_conn_id="redshift_default")
+    conn = redshift_hook.get_conn()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("""
+        CREATE SCHEMA IF NOT EXISTS reporting_schema;
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.genre_level_kpis (
+            listen_date DATE NOT NULL,
+            track_genre VARCHAR(255) NOT NULL,
+            listen_count INT,
+            popularity_index FLOAT,
+            average_duration FLOAT,
+            most_popular_track_id VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.tmp_genre_level_kpis (
+            listen_date DATE NOT NULL,
+            track_genre VARCHAR(255) NOT NULL,
+            listen_count INT,
+            popularity_index FLOAT,
+            average_duration FLOAT,
+            most_popular_track_id VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.hourly_kpis (
+            listen_date DATE NOT NULL,
+            listen_hour INT NOT NULL,
+            unique_listeners INT,
+            listen_counts INT,
+            top_artist VARCHAR(255),
+            avg_sessions_per_user FLOAT,
+            diversity_index FLOAT,
+            most_engaged_age_group VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS reporting_schema.tmp_hourly_kpis (
+            listen_date DATE NOT NULL,
+            listen_hour INT NOT NULL,
+            unique_listeners INT,
+            listen_counts INT,
+            top_artist VARCHAR(255),
+            avg_sessions_per_user FLOAT,
+            diversity_index FLOAT,
+            most_engaged_age_group VARCHAR(255)
+        );
+        """)
+        conn.commit()
+        logging.info("Ensured reporting_schema and KPI tables exist in Redshift")
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Failed to bootstrap Redshift schema: {e}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
 def upsert_to_redshift(df, table_name, id_columns):
     redshift_hook = PostgresHook(postgres_conn_id="redshift_default")
     conn = redshift_hook.get_conn()
@@ -258,6 +320,11 @@ def move_processed_files(ti):
         raise
 
 with DAG('data_validation_and_kpi_computation', default_args=default_args, schedule='@daily') as dag:
+    bootstrap_schema = PythonOperator(
+        task_id='bootstrap_redshift_schema',
+        python_callable=bootstrap_redshift_schema
+    )
+
     validate_datasets = PythonOperator(
         task_id='validate_datasets',
         python_callable=validate_datasets
@@ -288,5 +355,5 @@ with DAG('data_validation_and_kpi_computation', default_args=default_args, sched
         task_id='end_dag'
     )
 
-    validate_datasets >> check_validation >> [calculate_genre_level_kpis,end_dag]
+    bootstrap_schema >> validate_datasets >> check_validation >> [calculate_genre_level_kpis,end_dag]
     calculate_genre_level_kpis >> calculate_hourly_kpis>>move_files
