@@ -71,13 +71,13 @@ def validate_dataframe(df, dataset_name, source_name):
     logging.warning(f"Missing columns in {source_name}: {missing_columns}")
     return False
 
-def validate_datasets():
+def validate_datasets(ti):
     validation_results = {}
 
 
     datasets = {
         "songs":{"type": "single",
-                 "path":SONGS_FILE_PATH }, 
+                 "path":SONGS_FILE_PATH },
         "users":{"type": "single",
                  "path":USERS_FILE_PATH },
         "stream":{"type": "multiple",
@@ -87,7 +87,8 @@ def validate_datasets():
     for dataset, config in datasets.items():
         try:
             if config["type"] == 'multiple':
-                files = list_s3_files(config["prefix"])
+                files = list_s3_files(config["path"])
+                ti.xcom_push(key='stream_files', value=files)
                 results = []
 
                 for file in files:
@@ -166,8 +167,8 @@ def upsert_to_redshift(df, table_name, id_columns):
         cursor.close()
         conn.close()
 
-def calculate_genre_level_kpis():
-    stream_files = list_s3_files(STREAMS_PREFIX)
+def calculate_genre_level_kpis(ti):
+    stream_files = ti.xcom_pull(task_ids='validate_datasets', key='stream_files')
     streams_data = pd.concat([read_s3_csv(file) for file in stream_files], ignore_index=True)
     songs_data = read_s3_csv(SONGS_FILE_PATH)
 
@@ -194,9 +195,9 @@ def calculate_genre_level_kpis():
 
     upsert_to_redshift(final_kpis, 'genre_level_kpis', ['listen_date', 'track_genre'])
 
-def calculate_hourly_kpis():
+def calculate_hourly_kpis(ti):
 
-    stream_files = list_s3_files(STREAMS_PREFIX)
+    stream_files = ti.xcom_pull(task_ids='validate_datasets', key='stream_files')
     streams_data = pd.concat([read_s3_csv(file) for file in stream_files], ignore_index=True)
     songs_data = read_s3_csv(SONGS_FILE_PATH)
     users_data = read_s3_csv(USERS_FILE_PATH)
@@ -215,8 +216,8 @@ def calculate_hourly_kpis():
 
     # KPI 3: Listening Sessions per User per Hour
     full_data['session_id'] = full_data['user_id'].astype(str) + '-' + full_data['listen_time'].astype(str)
-    sessions_per_user = full_data.groupby(['listen_date', 'listen_hour', 'user_id']).nunique('session_id').reset_index()
-    avg_sessions_per_user = sessions_per_user.groupby(['listen_date', 'listen_hour'])['session_id'].mean().reset_index(name='avg_sessions_per_user')
+    sessions_per_user = full_data.groupby(['listen_date', 'listen_hour', 'user_id'])['session_id'].nunique().reset_index(name='session_count')
+    avg_sessions_per_user = sessions_per_user.groupby(['listen_date', 'listen_hour'])['session_count'].mean().reset_index(name='avg_sessions_per_user')
 
     # KPI 4: Hourly Track Diversity Index
     track_diversity = full_data.groupby(['listen_date', 'listen_hour'])['track_id'].agg(['nunique', 'count']).reset_index()
@@ -233,9 +234,6 @@ def calculate_hourly_kpis():
     final_kpis = final_kpis.merge(track_diversity[['listen_date', 'listen_hour', 'diversity_index']], on=['listen_date', 'listen_hour'])
     final_kpis = final_kpis.merge(most_engaged_group[['listen_date', 'listen_hour', 'most_engaged_age_group']], on=['listen_date', 'listen_hour'])
 
-    # Handle potential column conflicts from merges
-    final_kpis = final_kpis.rename(columns={'listen_counts_x': 'listen_counts'})
-
     # Select the final columns explicitly to match the Redshift table schema
     final_kpis = final_kpis[['listen_date', 'listen_hour', 'unique_listeners', 'listen_counts', 'top_artist',
                              'avg_sessions_per_user', 'diversity_index', 'most_engaged_age_group']]
@@ -245,13 +243,13 @@ def calculate_hourly_kpis():
 
     upsert_to_redshift(final_kpis, 'hourly_kpis', ['listen_date', 'listen_hour'])
 
-def move_processed_files():
+def move_processed_files(ti):
     s3 = boto3.client('s3')
     try:
-        stream_files = list_s3_files(STREAMS_PREFIX)
+        stream_files = ti.xcom_pull(task_ids='validate_datasets', key='stream_files')
         for file in stream_files:
             copy_source = {'Bucket': BUCKET_NAME, 'Key': file}
-            destination_key = file.replace('spotify_data/streams/', 'spotify_data/streams/archived/')
+            destination_key = file.replace(STREAMS_PREFIX, ARCHIVE_PREFIX)
             s3.copy_object(CopySource=copy_source, Bucket=BUCKET_NAME, Key=destination_key)
             s3.delete_object(Bucket=BUCKET_NAME, Key=file)
             logging.info(f"Moved {file} to {destination_key}")
