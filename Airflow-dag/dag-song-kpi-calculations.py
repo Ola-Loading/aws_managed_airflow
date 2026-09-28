@@ -23,7 +23,7 @@ default_args = {
 }
 
 # Constants for S3 bucket and file paths
-BUCKET_NAME = 'music-udemylab-bucket'
+BUCKET_NAME = 'music-sofar-sessions'
 SONGS_FILE_PATH = 'spotify_data/songs.csv'
 USERS_FILE_PATH = 'spotify_data/users.csv'
 STREAMS_PREFIX = 'spotify_data/streams/'
